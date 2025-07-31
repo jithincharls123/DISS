@@ -1,6 +1,6 @@
 """
 Few-shot dynamic gesture recognition using graph and temporal convolutional
-networks with a relation network classifier.
+networks with a nearest-neighbour classifier.
 
 This script reimplements the personalised few-shot gesture recogniser using
 a spatiotemporal backbone inspired by recent research. Graph-based models
@@ -8,11 +8,10 @@ can capture spatial relationships between hand keypoints by computing
 joint-to-joint and joint-to-group attentions【310899056794082†L224-L229】.
 Temporal dependencies are encoded by dilated convolutional networks and
 attention mechanisms【877238131962073†L118-L122】.  Our model replaces the
-prototype-based classifier with a relation network that learns to score
-the similarity between query and support embeddings.  Sequences are
-resampled to a length of 256 frames to provide finer temporal
-resolution.  Hyper-parameters such as the GCN output dimension, TCN
-channel sizes and relation-network hidden size are configurable via
+prototype-based classifier with a simple nearest-neighbour approach that
+compares embeddings directly.  Sequences are resampled to a length of 128
+frames to provide finer temporal resolution.  Hyper-parameters such as the
+GCN output dimension and TCN channel sizes are configurable via
 command-line options.
 
 Key features:
@@ -23,11 +22,10 @@ Key features:
 * **Temporal convolution:** A stack of dilated 1D convolutions captures
   short- and long-term temporal dependencies, akin to temporal
   convolutional networks.
-* **Relation network classifier:** Rather than averaging support embeddings
-  into prototypes, a small neural network learns to score query-support
-  embeddings.  Class scores are obtained by averaging relation scores
-  across support examples per class.
-* **Resampling length of 256:** Sequences are resampled to 256 frames by
+* **Nearest-neighbour classifier:** Instead of a prototype-based approach,
+  the system compares embeddings directly using a nearest-neighbour
+  strategy.
+* **Resampling length of 128:** Sequences are resampled to 128 frames by
   default, providing finer temporal resolution.
 
 The script preserves the asynchronous video capture, landmark extraction,
@@ -41,6 +39,8 @@ import logging
 import threading
 from collections import Counter, deque
 from typing import List, Tuple
+
+from tqdm import tqdm
 
 import cv2
 import mediapipe as mp
@@ -85,6 +85,8 @@ class VideoCaptureAsync:
     def __init__(self, src: int = 0, width: int | None = None, height: int | None = None,
                  buffer_size: int = 4) -> None:
         self.cap = cv2.VideoCapture(src)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"cannot open camera {src}")
         if width:
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         if height:
@@ -270,28 +272,10 @@ class STEncoder(nn.Module):
         return emb
 
 
-class RelationNetwork(nn.Module):
-    """Relation network for computing similarity between embeddings."""
-
-    def __init__(self, emb_dim: int, hidden_dim: int = 128) -> None:
-        super().__init__()
-        self.fc1 = nn.Linear(emb_dim * 2, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, 1)
-        self.relu = nn.ReLU()
-
-    def forward(self, query: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
-        B, E = query.shape
-        S = support.size(0)
-        q_exp = query.unsqueeze(1).expand(B, S, E)
-        s_exp = support.unsqueeze(0).expand(B, S, E)
-        x = torch.cat([q_exp, s_exp], dim=2)
-        x = self.relu(self.fc1(x))
-        scores = self.fc2(x).squeeze(-1)
-        return scores
 
 
 class DynamicFewShotRecognizer:
-    """Encapsulates support capture and live inference using GCN-TCN and relation network."""
+    """Encapsulates support capture and live inference using GCN-TCN and nearest-neighbour matching."""
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -310,10 +294,8 @@ class DynamicFewShotRecognizer:
             self.encoder = torch.quantization.quantize_dynamic(
                 self.encoder, {nn.Linear, nn.Conv1d}, dtype=torch.qint8
             )
-        self.relnet = RelationNetwork(args.emb_dim, hidden_dim=args.relnet_hidden)
-        self.relnet.to(self.device)
-        self.relnet.eval()
         self.support_embeds: List[torch.Tensor] = []
+        self.support_seqs: List[torch.Tensor] = []
         self.support_labels: List[int] = []
         self.names: List[str] = []
 
@@ -325,6 +307,7 @@ class DynamicFewShotRecognizer:
                         augment_times: int) -> bool:
         self.names = names
         embeds: List[torch.Tensor] = []
+        seqs: List[torch.Tensor] = []
         labels: List[int] = []
         cv2.namedWindow('Support Capture', cv2.WINDOW_NORMAL)
         try:
@@ -345,8 +328,10 @@ class DynamicFewShotRecognizer:
                         cv2.destroyAllWindows()
                         return False
                 for shot in range(1, shots + 1):
+                    logger.info("capturing gesture '%s' shot %d/%d", name, shot, shots)
                     buf: List[torch.Tensor] = []
                     t0 = cv2.getTickCount()
+                    bar = tqdm(total=seq_len, desc=f"{name} shot {shot}/{shots}", leave=False)
                     while len(buf) < seq_len:
                         ret, frm = self.cap.read()
                         if not ret:
@@ -354,29 +339,35 @@ class DynamicFewShotRecognizer:
                         lm = extract_landmarks(frm, self.smoother)
                         if lm is not None:
                             buf.append(lm)
-                        cv2.putText(frm, f"Capturing '{name}' {len(buf)}/{seq_len}",
+                            bar.update(1)
+                        cv2.putText(frm, f"{name} shot {shot}/{shots} {len(buf)}/{seq_len}",
                                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
                         cv2.imshow('Support Capture', frm)
                         key = cv2.waitKey(1) & 0xFF
                         if key == ord('q'):
+                            bar.close()
                             self.cap.release()
                             cv2.destroyAllWindows()
                             return False
                         if ((cv2.getTickCount() - t0) / cv2.getTickFrequency() > CONFIG['support_timeout']):
                             logger.warning("timed out on %s shot %d", name, shot)
                             break
+                    bar.close()
                     if buf:
                         seq = resample_sequence(torch.stack(buf), seq_len)
-                        seq = seq.view(seq.size(0), -1)
+                        seq_flat = seq.view(seq.size(0), -1)
                         with torch.inference_mode():
-                            emb = self.encoder(seq.unsqueeze(0).to(self.device))
+                            emb = self.encoder(seq_flat.unsqueeze(0).to(self.device))
                         embeds.append(emb.squeeze(0))
+                        seqs.append(seq_flat)
                         labels.append(idx)
                         for _ in range(augment_times):
                             noisy = seq + torch.randn_like(seq) * CONFIG['pos_noise_std']
+                            noisy_flat = noisy.view(noisy.size(0), -1)
                             with torch.inference_mode():
-                                emb_aug = self.encoder(noisy.unsqueeze(0).to(self.device))
+                                emb_aug = self.encoder(noisy_flat.unsqueeze(0).to(self.device))
                             embeds.append(emb_aug.squeeze(0))
+                            seqs.append(noisy_flat)
                             labels.append(idx)
         finally:
             cv2.destroyWindow('Support Capture')
@@ -384,38 +375,11 @@ class DynamicFewShotRecognizer:
             logger.error("no support data captured")
             return False
         self.support_embeds = embeds
+        self.support_seqs = seqs
         self.support_labels = labels
-        self._train_relation_network()
+        # no relation network training for nearest-neighbour inference
         return True
 
-    def _train_relation_network(self, epochs: int = 50, lr: float = 0.01) -> None:
-        """Fine-tune the relation network on pairs of support embeddings."""
-        if len(self.support_embeds) < 2:
-            return
-        device = self.device
-        embeds = torch.stack(self.support_embeds).to(device)
-        labels = torch.tensor(self.support_labels, device=device)
-        pair_x = []
-        pair_y = []
-        for i in range(len(embeds)):
-            for j in range(len(embeds)):
-                if i == j:
-                    continue
-                pair_x.append(torch.cat([embeds[i], embeds[j]], dim=0))
-                pair_y.append(1.0 if labels[i] == labels[j] else 0.0)
-        x = torch.stack(pair_x).to(device)
-        y = torch.tensor(pair_y, device=device).unsqueeze(1)
-        criterion = nn.BCEWithLogitsLoss()
-        optimiser = torch.optim.SGD(self.relnet.parameters(), lr=lr)
-        self.relnet.train()
-        for _ in range(epochs):
-            optimiser.zero_grad()
-            z = self.relnet.relu(self.relnet.fc1(x))
-            logits = self.relnet.fc2(z)
-            loss = criterion(logits, y)
-            loss.backward()
-            optimiser.step()
-        self.relnet.eval()
 
     def run_live(self, seq_len: int, min_len: int, conf_thresh: float) -> None:
         if not self.support_embeds:
@@ -449,15 +413,15 @@ class DynamicFewShotRecognizer:
                     seq_flat = seq.view(seq.size(0), -1).unsqueeze(0).to(self.device)
                     with torch.inference_mode():
                         q_emb = self.encoder(seq_flat)
-                    rel_scores = self.relnet(q_emb, support_tensor)
+                    dists = torch.norm(support_tensor - q_emb, dim=1)
                     class_scores = []
                     for i in range(len(self.names)):
                         mask = (support_labels == i)
                         if mask.any():
-                            class_scores.append(rel_scores[:, mask].mean(dim=1))
+                            class_scores.append(-dists[mask].mean())
                         else:
-                            class_scores.append(torch.tensor([float('-inf')], device=self.device))
-                    class_scores = torch.stack(class_scores, dim=1)
+                            class_scores.append(torch.tensor(float('-inf'), device=self.device))
+                    class_scores = torch.stack(class_scores).unsqueeze(0)
                     probs = F.softmax(class_scores, dim=1).cpu().squeeze(0)
                     conf_tensor, idx_tensor = probs.max(dim=0)
                     conf = conf_tensor.item()
@@ -488,13 +452,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description='Graph-TCN few-shot gesture recogniser')
     parser.add_argument('--camera', type=int, default=0, help='Index of camera to use')
     parser.add_argument('--shots', type=int, default=6, help='Number of support samples per class')
-    parser.add_argument('--seq_len', type=int, default=256, help='Resampled sequence length')
+    parser.add_argument('--seq_len', type=int, default=128, help='Resampled sequence length')
     parser.add_argument('--min_len', type=int, default=None, help='Minimum window size before inference')
     parser.add_argument('--gcn_out_dim', type=int, default=32, help='Output dimension of GCN layer')
     parser.add_argument('--tcn_channels', type=int, nargs='+', default=[128, 256, 256],
                         help='List of channels for TCN layers')
     parser.add_argument('--emb_dim', type=int, default=256, help='Embedding dimension')
-    parser.add_argument('--relnet_hidden', type=int, default=128, help='Hidden dimension of relation network')
     parser.add_argument('--augment', type=int, default=3, help='Number of noise augmentations per support sample')
     parser.add_argument('--conf_thresh', type=float, default=0.45, help='Confidence threshold for predictions')
     args, _ = parser.parse_known_args()
@@ -505,6 +468,7 @@ def main() -> None:
     if not ok:
         logger.error("support capture aborted")
         return
+    logger.info("starting live inference")
     recogniser.run_live(args.seq_len, args.min_len, args.conf_thresh)
 
 
