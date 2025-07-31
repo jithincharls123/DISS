@@ -85,6 +85,8 @@ class VideoCaptureAsync:
     def __init__(self, src: int = 0, width: int | None = None, height: int | None = None,
                  buffer_size: int = 4) -> None:
         self.cap = cv2.VideoCapture(src)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"cannot open camera {src}")
         if width:
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         if height:
@@ -345,6 +347,7 @@ class DynamicFewShotRecognizer:
                         cv2.destroyAllWindows()
                         return False
                 for shot in range(1, shots + 1):
+                    logger.info("capturing gesture '%s' shot %d/%d", name, shot, shots)
                     buf: List[torch.Tensor] = []
                     t0 = cv2.getTickCount()
                     while len(buf) < seq_len:
@@ -354,7 +357,7 @@ class DynamicFewShotRecognizer:
                         lm = extract_landmarks(frm, self.smoother)
                         if lm is not None:
                             buf.append(lm)
-                        cv2.putText(frm, f"Capturing '{name}' {len(buf)}/{seq_len}",
+                        cv2.putText(frm, f"{name} shot {shot}/{shots} {len(buf)}/{seq_len}",
                                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
                         cv2.imshow('Support Capture', frm)
                         key = cv2.waitKey(1) & 0xFF
@@ -505,6 +508,7 @@ def main() -> None:
     if not ok:
         logger.error("support capture aborted")
         return
+    logger.info("starting live inference")
     recogniser.run_live(args.seq_len, args.min_len, args.conf_thresh)
 
 
