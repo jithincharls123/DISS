@@ -10,10 +10,10 @@ Temporal dependencies are encoded by dilated convolutional networks and
 attention mechanisms【877238131962073†L118-L122】.  Our model replaces the
 prototype-based classifier with a relation network that learns to score
 the similarity between query and support embeddings.  Sequences are
-resampled to a length of 256 frames to provide finer temporal
-resolution.  Hyper-parameters such as the GCN output dimension, TCN
-channel sizes and relation-network hidden size are configurable via
-command-line options.
+resampled to a length of 128 frames by default to improve responsiveness,
+mirroring the settings used in the FSGR 2024 paper.  Hyper-parameters such
+as the GCN output dimension, TCN channel sizes and relation-network hidden
+size are configurable via command-line options.
 
 Key features:
 
@@ -27,8 +27,8 @@ Key features:
   into prototypes, a small neural network learns to score query-support
   embeddings.  Class scores are obtained by averaging relation scores
   across support examples per class.
-* **Resampling length of 256:** Sequences are resampled to 256 frames by
-  default, providing finer temporal resolution.
+* **Resampling length of 128:** Sequences are resampled to 128 frames by
+  default for faster processing while retaining temporal context.
 
 The script preserves the asynchronous video capture, landmark extraction,
 windowing, and smoothing from the previous version.  Use the command
@@ -354,8 +354,11 @@ class DynamicFewShotRecognizer:
                         lm = extract_landmarks(frm, self.smoother)
                         if lm is not None:
                             buf.append(lm)
-                        cv2.putText(frm, f"Capturing '{name}' {len(buf)}/{seq_len}",
-                                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+                        progress = int((len(buf) / seq_len) * 400)
+                        cv2.rectangle(frm, (10, 60), (410, 80), (255, 255, 255), 2)
+                        cv2.rectangle(frm, (10, 60), (10 + progress, 80), (0, 255, 0), -1)
+                        msg = f"{name}  Shot {shot}/{shots}  Frame {len(buf)}/{seq_len}"
+                        cv2.putText(frm, msg, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                         cv2.imshow('Support Capture', frm)
                         key = cv2.waitKey(1) & 0xFF
                         if key == ord('q'):
@@ -372,6 +375,7 @@ class DynamicFewShotRecognizer:
                             emb = self.encoder(seq.unsqueeze(0).to(self.device))
                         embeds.append(emb.squeeze(0))
                         labels.append(idx)
+                        logger.info("captured %s shot %d/%d", name, shot, shots)
                         for _ in range(augment_times):
                             noisy = seq + torch.randn_like(seq) * CONFIG['pos_noise_std']
                             with torch.inference_mode():
@@ -473,8 +477,11 @@ class DynamicFewShotRecognizer:
                     cv2.putText(frame, f"{label}: {ema_prob * 100:.1f}%",
                                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                 else:
+                    cv2.rectangle(frame, (10, 60), (410, 80), (255, 255, 255), 2)
+                    prog = int((len(window) / min_len) * 400)
+                    cv2.rectangle(frame, (10, 60), (10 + prog, 80), (0, 255, 0), -1)
                     cv2.putText(frame, f"Collecting frames: {len(window)}/{min_len}",
-                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+                                (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                 cv2.imshow('Live', frame)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
@@ -488,7 +495,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description='Graph-TCN few-shot gesture recogniser')
     parser.add_argument('--camera', type=int, default=0, help='Index of camera to use')
     parser.add_argument('--shots', type=int, default=6, help='Number of support samples per class')
-    parser.add_argument('--seq_len', type=int, default=256, help='Resampled sequence length')
+    parser.add_argument('--seq_len', type=int, default=128, help='Resampled sequence length')
     parser.add_argument('--min_len', type=int, default=None, help='Minimum window size before inference')
     parser.add_argument('--gcn_out_dim', type=int, default=32, help='Output dimension of GCN layer')
     parser.add_argument('--tcn_channels', type=int, nargs='+', default=[128, 256, 256],
