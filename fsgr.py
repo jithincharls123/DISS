@@ -9,7 +9,7 @@ joint-to-joint and joint-to-group attentions【310899056794082†L224-L229】.
 Temporal dependencies are encoded by dilated convolutional networks and
 attention mechanisms【877238131962073†L118-L122】.  Our model replaces the
 prototype-based classifier with a simple nearest-neighbour approach that
-compares embeddings directly.  Sequences are resampled to a length of 256
+compares embeddings directly.  Sequences are resampled to a length of 128
 frames to provide finer temporal resolution.  Hyper-parameters such as the
 GCN output dimension and TCN channel sizes are configurable via
 command-line options.
@@ -25,7 +25,7 @@ Key features:
 * **Nearest-neighbour classifier:** Instead of a prototype-based approach,
   the system compares embeddings directly using a nearest-neighbour
   strategy.
-* **Resampling length of 256:** Sequences are resampled to 256 frames by
+* **Resampling length of 128:** Sequences are resampled to 128 frames by
   default, providing finer temporal resolution.
 
 The script preserves the asynchronous video capture, landmark extraction,
@@ -39,6 +39,8 @@ import logging
 import threading
 from collections import Counter, deque
 from typing import List, Tuple
+
+from tqdm import tqdm
 
 import cv2
 import mediapipe as mp
@@ -329,6 +331,7 @@ class DynamicFewShotRecognizer:
                     logger.info("capturing gesture '%s' shot %d/%d", name, shot, shots)
                     buf: List[torch.Tensor] = []
                     t0 = cv2.getTickCount()
+                    bar = tqdm(total=seq_len, desc=f"{name} shot {shot}/{shots}", leave=False)
                     while len(buf) < seq_len:
                         ret, frm = self.cap.read()
                         if not ret:
@@ -336,17 +339,20 @@ class DynamicFewShotRecognizer:
                         lm = extract_landmarks(frm, self.smoother)
                         if lm is not None:
                             buf.append(lm)
+                            bar.update(1)
                         cv2.putText(frm, f"{name} shot {shot}/{shots} {len(buf)}/{seq_len}",
                                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
                         cv2.imshow('Support Capture', frm)
                         key = cv2.waitKey(1) & 0xFF
                         if key == ord('q'):
+                            bar.close()
                             self.cap.release()
                             cv2.destroyAllWindows()
                             return False
                         if ((cv2.getTickCount() - t0) / cv2.getTickFrequency() > CONFIG['support_timeout']):
                             logger.warning("timed out on %s shot %d", name, shot)
                             break
+                    bar.close()
                     if buf:
                         seq = resample_sequence(torch.stack(buf), seq_len)
                         seq_flat = seq.view(seq.size(0), -1)
@@ -446,7 +452,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description='Graph-TCN few-shot gesture recogniser')
     parser.add_argument('--camera', type=int, default=0, help='Index of camera to use')
     parser.add_argument('--shots', type=int, default=6, help='Number of support samples per class')
-    parser.add_argument('--seq_len', type=int, default=256, help='Resampled sequence length')
+    parser.add_argument('--seq_len', type=int, default=128, help='Resampled sequence length')
     parser.add_argument('--min_len', type=int, default=None, help='Minimum window size before inference')
     parser.add_argument('--gcn_out_dim', type=int, default=32, help='Output dimension of GCN layer')
     parser.add_argument('--tcn_channels', type=int, nargs='+', default=[128, 256, 256],
